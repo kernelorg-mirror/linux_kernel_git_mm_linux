@@ -280,6 +280,10 @@ void unmap_vmas(struct mmu_gather *tlb, struct unmap_desc *unmap);
 
 #ifdef CONFIG_MMU
 
+bool cond_install_uffd_wp_ptes(struct vm_area_struct *vma,
+		unsigned long addr, pte_t *ptep, pte_t pte,
+		unsigned long nr_ptes);
+
 static inline void get_anon_vma(struct anon_vma *anon_vma)
 {
 	atomic_inc(&anon_vma->refcount);
@@ -868,7 +872,15 @@ struct compact_control {
  * immediately when one is created during the free path.
  */
 struct capture_control {
-	struct compact_control *cc;
+	struct zone *zone;
+	int migratetype;
+	/*
+	 * Allocation request order. May differ from the compaction
+	 * order: defrag_mode promotes sub-block allocations to
+	 * pageblock-order compaction; capture still matches at the
+	 * original allocation order so prep_new_page() is consistent.
+	 */
+	int order;
 	struct page *page;
 };
 
