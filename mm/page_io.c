@@ -25,6 +25,7 @@
 #include <linux/sched/task.h>
 #include <linux/delayacct.h>
 #include <linux/zswap.h>
+#include <linux/swap_ops.h>
 #include "swap.h"
 #include "swap_table.h"
 
@@ -300,15 +301,6 @@ static bool folio_blkg_can_merge(struct folio *folio, struct folio *prev_folio)
 #define bio_associate_blkg_from_page(bio, folio)		do { } while (0)
 #endif /* CONFIG_MEMCG && CONFIG_BLK_CGROUP */
 
-struct swap_iocb {
-	union {
-		struct kiocb	iocb;
-		struct bio	bio;
-	};
-	struct bio_vec		bvecs[SWAP_CLUSTER_MAX];
-	int			nr_bvecs;
-	int			len;
-};
 static mempool_t *sio_pool;
 
 int sio_pool_init(void)
@@ -358,7 +350,16 @@ static void swap_add_folio(struct swap_io_ctx *ctx, struct folio *folio, int rw)
 	}
 	bvec_set_folio(&sio->bvecs[sio->nr_bvecs], folio, folio_size(folio), 0);
 	sio->len += folio_size(folio);
-	if (++sio->nr_bvecs == ARRAY_SIZE(sio->bvecs)) {
+
+	/*
+	 * Write out the iocb if we filled it, or if the device is synchronous.
+	 *
+	 * The latter is to work around expectations in the classic LRU code
+	 * which make synchronous clearing of the folio writeback flag in the
+	 * reclaim path beneficial.
+	 */
+	if (++sio->nr_bvecs == ARRAY_SIZE(sio->bvecs) ||
+	    (rw == WRITE && (sis->flags & SWP_SYNCHRONOUS_IO))) {
 		if (rw == WRITE)
 			swap_write_submit(ctx);
 		else
@@ -649,11 +650,9 @@ const struct swap_ops swap_bdev_ops = {
 	.can_merge		= swap_bdev_can_merge,
 };
 
-static void swap_fs_submit(struct swap_io_ctx *ctx, int rw)
+void swap_fs_prepare_rw(struct swap_io_ctx *ctx, int rw, struct iov_iter *iter)
 {
 	struct swap_iocb *sio = ctx->sio;
-	struct iov_iter iter;
-	int ret;
 
 	init_sync_kiocb(&sio->iocb, ctx->sis->swap_file);
 	sio->iocb.ki_pos = swap_dev_pos(bvec_folio(&sio->bvecs[0])->swap);
@@ -662,40 +661,22 @@ static void swap_fs_submit(struct swap_io_ctx *ctx, int rw)
 	else
 		sio->iocb.ki_complete = swap_fs_read_complete;
 
-	iov_iter_bvec(&iter, rw == WRITE ? ITER_SOURCE : ITER_DEST,
+	iov_iter_bvec(iter, rw == WRITE ? ITER_SOURCE : ITER_DEST,
 			sio->bvecs, sio->nr_bvecs, sio->len);
-	ret = sio->iocb.ki_filp->f_mapping->a_ops->swap_rw(&sio->iocb, &iter);
-	if (ret != -EIOCBQUEUED)
-		sio->iocb.ki_complete(&sio->iocb, ret);
 }
+EXPORT_SYMBOL_GPL(swap_fs_prepare_rw);
 
-static void swap_fs_submit_write(struct swap_io_ctx *ctx)
-{
-	swap_fs_submit(ctx, WRITE);
-}
-
-static void swap_fs_submit_read(struct swap_io_ctx *ctx)
-{
-	swap_fs_submit(ctx, READ);
-}
-
-static bool swap_fs_can_merge(struct folio *folio, struct folio *prev_folio,
+bool swap_fs_can_merge(struct folio *folio, struct folio *prev_folio,
 		size_t prev_folio_size, int rw)
 {
 	return swap_dev_pos(folio->swap) ==
 		swap_dev_pos(prev_folio->swap) + prev_folio_size;
 }
+EXPORT_SYMBOL_GPL(swap_fs_can_merge);
 
-static const struct swap_ops swap_fs_ops = {
-	.flags			= SWAP_OPS_F_REQUIRE_NOFS,
-	.submit_write		= swap_fs_submit_write,
-	.submit_read		= swap_fs_submit_read,
-	.can_merge		= swap_fs_can_merge,
-};
-
-int swap_fs_activate(struct swap_info_struct *sis)
+int swap_fs_activate(struct swap_info_struct *sis, const struct swap_ops *ops)
 {
-	sis->ops = &swap_fs_ops;
+	sis->ops = ops;
 	return add_swap_extent(sis, 0, sis->max, 0);
 }
 EXPORT_SYMBOL_GPL(swap_fs_activate);
