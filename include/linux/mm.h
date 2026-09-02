@@ -57,16 +57,6 @@ static inline unsigned long totalram_pages(void)
 	return (unsigned long)atomic_long_read(&_totalram_pages);
 }
 
-static inline void totalram_pages_inc(void)
-{
-	atomic_long_inc(&_totalram_pages);
-}
-
-static inline void totalram_pages_dec(void)
-{
-	atomic_long_dec(&_totalram_pages);
-}
-
 static inline void totalram_pages_add(long count)
 {
 	atomic_long_add(count, &_totalram_pages);
@@ -4078,12 +4068,6 @@ void free_reserved_pages(struct page *page, unsigned int order);
 static inline void free_reserved_page(struct page *page)
 {
 	free_reserved_pages(page, 0);
-}
-
-static inline void mark_page_reserved(struct page *page)
-{
-	SetPageReserved(page);
-	adjust_managed_page_count(page, -1);
 }
 
 static inline void free_reserved_ptdesc(struct ptdesc *pt)
