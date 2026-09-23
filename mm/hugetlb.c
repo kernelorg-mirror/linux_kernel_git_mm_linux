@@ -5408,7 +5408,7 @@ void __unmap_hugepage_range(struct mmu_gather *tlb, struct vm_area_struct *vma,
 			int rc = vma_needs_reservation(h, vma, address);
 
 			if (rc < 0)
-				/* Pressumably allocate_file_region_entries failed
+				/* Presumably allocate_file_region_entries failed
 				 * to allocate a file_region struct. Clear
 				 * hugetlb_restore_reserve so that global reserve
 				 * count will not be incremented by free_huge_folio.
@@ -5438,10 +5438,12 @@ void __hugetlb_zap_begin(struct vm_area_struct *vma,
 	if (!vma->vm_file)	/* hugetlbfs_file_mmap error */
 		return;
 
-	adjust_range_if_pmd_sharing_possible(vma, start, end);
 	hugetlb_vma_lock_write(vma);
-	if (vma->vm_file)
+	if (vma->vm_file) {
 		i_mmap_lock_write(vma->vm_file->f_mapping);
+		if (hugetlbfs_pmd_sharing_seen(file_inode(vma->vm_file)))
+			adjust_range_if_pmd_sharing_possible(vma, start, end);
+	}
 }
 
 void __hugetlb_zap_end(struct vm_area_struct *vma,
@@ -5480,7 +5482,9 @@ void unmap_hugepage_range(struct vm_area_struct *vma, unsigned long start,
 
 	mmu_notifier_range_init(&range, MMU_NOTIFY_CLEAR, 0, vma->vm_mm,
 				start, end);
-	adjust_range_if_pmd_sharing_possible(vma, &range.start, &range.end);
+	if (hugetlbfs_pmd_sharing_seen(file_inode(vma->vm_file)))
+		adjust_range_if_pmd_sharing_possible(vma, &range.start,
+						     &range.end);
 	mmu_notifier_invalidate_range_start(&range);
 	tlb_gather_mmu(&tlb, vma->vm_mm);
 
@@ -5621,7 +5625,7 @@ retry_avoidcopy:
 	 * In order to determine where this is a COW on a MAP_PRIVATE mapping it
 	 * is enough to check whether the old_folio is anonymous. This means that
 	 * the reserve for this address was consumed. If reserves were used, a
-	 * partial faulted mapping at the fime of fork() could consume its reserves
+	 * partial faulted mapping at the time of fork() could consume its reserves
 	 * on COW instead of the full address range.
 	 */
 	if (is_vma_resv_set(vma, HPAGE_RESV_OWNER) &&
@@ -7083,6 +7087,7 @@ pte_t *huge_pmd_share(struct mm_struct *mm, struct vm_area_struct *vma,
 	if (pud_none(*pud)) {
 		pud_populate(mm, pud,
 				(pmd_t *)((unsigned long)spte & PAGE_MASK));
+		hugetlbfs_set_pmd_sharing_seen(mapping->host);
 		mm_inc_nr_pmds(mm);
 	} else {
 		ptdesc_pmd_pts_dec(virt_to_ptdesc(spte));
