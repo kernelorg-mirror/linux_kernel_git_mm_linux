@@ -180,6 +180,7 @@ struct obj_cgroup {
 	struct percpu_ref refcnt;
 	struct mem_cgroup *memcg;
 	atomic_t nr_charged_bytes;
+	refcount_t private_id_ref;
 	union {
 		struct list_head list; /* protected by objcg_lock */
 		struct rcu_head rcu;
@@ -224,9 +225,6 @@ struct mem_cgroup {
 
 	/* vmpressure notifications. Written on every reclaim iteration. */
 	struct vmpressure vmpressure;
-
-	/* Written on every swap charge and uncharge. */
-	refcount_t private_id_ref;
 
 #ifdef CONFIG_MEMCG_NMI_SAFETY_REQUIRES_ATOMIC
 	/* MEMCG_KMEM for nmi context */
@@ -324,10 +322,11 @@ struct mem_cgroup {
 	unsigned long zswap_max;
 #endif
 
+	/* The objcg holding private memcg ID. */
+	struct obj_cgroup *private_id_objcg;
+
 	/* Private memcg ID. Used to ID objects that outlive the cgroup */
 	int private_id;
-
-	int kmemcg_id;
 
 	/*
 	 * Should the OOM killer kill all belonging tasks, had it kill one?
@@ -1819,15 +1818,6 @@ static inline void memcg_kmem_uncharge_page(struct page *page, int order)
 		__memcg_kmem_uncharge_page(page, order);
 }
 
-/*
- * A helper for accessing memcg's kmem_id, used for getting
- * corresponding LRU lists.
- */
-static inline int memcg_kmem_id(const struct mem_cgroup *memcg)
-{
-	return memcg ? memcg->kmemcg_id : -1;
-}
-
 struct mem_cgroup *mem_cgroup_from_virt(void *p);
 
 static inline void count_objcg_events(struct obj_cgroup *objcg,
@@ -1893,11 +1883,6 @@ static inline bool memcg_bpf_enabled(void)
 static inline bool memcg_kmem_online(void)
 {
 	return false;
-}
-
-static inline int memcg_kmem_id(const struct mem_cgroup *memcg)
-{
-	return -1;
 }
 
 static inline struct mem_cgroup *mem_cgroup_from_virt(void *p)
