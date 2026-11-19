@@ -4344,7 +4344,7 @@ bool lru_gen_look_around(struct page_vma_mapped_walk *pvmw, unsigned int nr)
 	walk = current->reclaim_state ? current->reclaim_state->mm_walk : NULL;
 
 	start = max(addr & PMD_MASK, vma->vm_start);
-	end = min(addr | ~PMD_MASK, vma->vm_end - 1) + 1;
+	end = pte_table_clamped_end(addr, vma->vm_end);
 
 	if (end - start == PAGE_SIZE)
 		return true;
@@ -5504,7 +5504,7 @@ static bool __maybe_unused state_is_valid(struct lruvec *lruvec)
 static bool fill_evictable(struct lruvec *lruvec)
 {
 	enum lru_list lru;
-	int remaining = MAX_LRU_BATCH;
+	int remaining = MIN_LRU_BATCH;
 
 	for_each_evictable_lru(lru) {
 		int type = is_file_lru(lru);
@@ -5549,7 +5549,7 @@ static bool fill_evictable(struct lruvec *lruvec)
 static bool drain_evictable(struct lruvec *lruvec)
 {
 	int gen, type, zone;
-	int remaining = MAX_LRU_BATCH;
+	int remaining = MIN_LRU_BATCH;
 
 	for_each_gen_type_zone(gen, type, zone) {
 		struct list_head *head = &lruvec->lrugen.folios[gen][type][zone];
