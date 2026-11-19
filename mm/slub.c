@@ -462,8 +462,6 @@ struct slab_sheaf {
 	union {
 		struct rcu_head rcu_head;
 		struct list_head barn_list;
-		/* only used to defer call_rcu() in unknown context */
-		struct llist_node llnode;
 		/* only used for prefilled sheafs */
 		struct {
 			unsigned int capacity;
@@ -2533,7 +2531,8 @@ static inline void slab_obj_ext_has_codetag_init(void)
 
 #ifdef CONFIG_MEMCG
 
-static void memcg_alloc_abort_single(struct kmem_cache *s, void *object);
+static void memcg_alloc_abort_single(struct kmem_cache *s, void *object,
+				     unsigned int alloc_flags);
 
 static __fastpath_inline
 bool memcg_slab_post_alloc_hook(struct kmem_cache *s, gfp_t flags,
@@ -2551,7 +2550,7 @@ bool memcg_slab_post_alloc_hook(struct kmem_cache *s, gfp_t flags,
 		return true;
 
 	if (likely(size == 1)) {
-		memcg_alloc_abort_single(s, *p);
+		memcg_alloc_abort_single(s, *p, ac->alloc_flags);
 		*p = NULL;
 	} else {
 		kmem_cache_free_bulk(s, size, p);
@@ -2686,37 +2685,51 @@ struct rcu_delayed_free {
  * - memcg_slab_post_alloc_hook()
  * - alloc_tagging_slab_alloc_hook()
  *
+ * slab_free_hook() assumes that memcg_slab_free_hook() and
+ * alloc_tagging_slab_free_hook() are already invoked.
+ *
  * Free hooks that must handle missing corresponding alloc hooks:
  * - kmemleak_free_recursive()
  * - kfence_free()
  *
- * Free hooks that have no alloc hook counterpart, and thus safe to call:
+ * Free hooks that have no alloc hook counterpart:
  * - debug_check_no_locks_freed()
  * - debug_check_no_obj_freed()
  * - __kcsan_check_access()
  */
 static __always_inline
-bool slab_free_hook(struct kmem_cache *s, void *x, bool init,
-		    bool after_rcu_delay)
+bool slab_free_hook(struct kmem_cache *s, void *x, unsigned int free_flags)
 {
+	bool init = free_flags & SLAB_FREE_INIT;
+	bool after_rcu_delay = free_flags & SLAB_FREE_AFTER_RCU_DELAY;
+	bool allow_spin = free_flags_allow_spinning(free_flags);
 	/* Are the object contents still accessible? */
 	bool still_accessible = (s->flags & SLAB_TYPESAFE_BY_RCU) && !after_rcu_delay;
 
-	kmemleak_free_recursive(x, s->flags);
 	kmsan_slab_free(s, x);
 
+	/*
+	 * debug_locks, KCSAN, KASAN may acquire a spinlock to report a bug,
+	 * but otherwise cannot deadlock. Take the risk of deadlock for
+	 * reporting.
+	 */
 	debug_check_no_locks_freed(x, s->object_size);
-
-	if (!(s->flags & SLAB_DEBUG_OBJECTS))
-		debug_check_no_obj_freed(x, s->object_size);
 
 	/* Use KCSAN to help debug racy use-after-free. */
 	if (!still_accessible)
 		__kcsan_check_access(x, s->object_size,
 				     KCSAN_ACCESS_WRITE | KCSAN_ACCESS_ASSERT);
 
-	if (kfence_free(x))
-		return false;
+	/* Hooks that acquire locks or kmalloc_nolock() skips alloc hook counterpart */
+	if (likely(allow_spin)) {
+		kmemleak_free_recursive(x, s->flags);
+
+		if (!(s->flags & SLAB_DEBUG_OBJECTS))
+			debug_check_no_obj_freed(x, s->object_size);
+
+		if (kfence_free(x))
+			return false;
+	}
 
 	/*
 	 * Give KASAN a chance to notice an invalid free operation before we
@@ -2729,6 +2742,7 @@ bool slab_free_hook(struct kmem_cache *s, void *x, bool init,
 	if (still_accessible) {
 		struct rcu_delayed_free *delayed_free;
 
+		VM_WARN_ON_ONCE(!allow_spin);
 		delayed_free = kmalloc_obj(*delayed_free, GFP_NOWAIT);
 		if (delayed_free) {
 			/*
@@ -2776,8 +2790,11 @@ bool slab_free_hook(struct kmem_cache *s, void *x, bool init,
 		set_orig_size(s, x, orig_size);
 
 	}
-	/* KASAN might put x into memory quarantine, delaying its reuse. */
-	return !kasan_slab_free(s, x, init, still_accessible, false);
+	/*
+	 * KASAN might put x into memory quarantine, delaying its reuse.
+	 * Skip quarantine when spinning is not allowed as it uses a spinlock.
+	 */
+	return !kasan_slab_free(s, x, init, still_accessible, !allow_spin);
 }
 
 static __fastpath_inline
@@ -2788,10 +2805,10 @@ bool slab_free_freelist_hook(struct kmem_cache *s, void **head, void **tail,
 	void *object;
 	void *next = *head;
 	void *old_tail = *tail;
-	bool init;
+	unsigned int free_flags = SLAB_FREE_DEFAULT;
 
 	if (is_kfence_address(next)) {
-		slab_free_hook(s, next, false, false);
+		slab_free_hook(s, next, free_flags);
 		return false;
 	}
 
@@ -2799,14 +2816,15 @@ bool slab_free_freelist_hook(struct kmem_cache *s, void **head, void **tail,
 	*head = NULL;
 	*tail = NULL;
 
-	init = slab_want_init_on_free(s);
+	if (slab_want_init_on_free(s))
+		free_flags |= SLAB_FREE_INIT;
 
 	do {
 		object = next;
 		next = get_freepointer(s, object);
 
 		/* If object's reuse doesn't have to be delayed */
-		if (likely(slab_free_hook(s, object, init, false))) {
+		if (likely(slab_free_hook(s, object, free_flags))) {
 			/* Move object to the new freelist */
 			set_freepointer(s, object, *head);
 			*head = object;
@@ -2850,6 +2868,14 @@ static struct slab_sheaf *__alloc_empty_sheaf(struct kmem_cache *s, gfp_t gfp,
 	if (s->flags & SLAB_KMALLOC)
 		alloc_flags |= SLAB_ALLOC_NO_RECURSE;
 
+	/*
+	 * kmemleak allocates its metadata from SLAB_NOLEAKTRACE caches, so
+	 * tracking their sheaves would recurse into kmemleak. NO_RECURSE stops
+	 * NO_LEAKTRACE from reaching the kmalloc cache's own sheaf allocation.
+	 */
+	if (s->flags & SLAB_NOLEAKTRACE)
+		alloc_flags |= SLAB_ALLOC_NO_LEAKTRACE | SLAB_ALLOC_NO_RECURSE;
+
 	sheaf_size = struct_size(sheaf, objects, capacity);
 	sheaf = kmalloc_flags(sheaf_size, gfp | __GFP_ZERO, alloc_flags, NUMA_NO_NODE);
 
@@ -2883,7 +2909,7 @@ static void __free_empty_sheaf(struct kmem_cache *s, struct slab_sheaf *sheaf,
 	 * warning, therefore replace NULL with CODETAG_EMPTY to indicate
 	 * that the extension for this sheaf is expected to be NULL.
 	 */
-	if (s->flags & SLAB_KMALLOC)
+	if (s->flags & (SLAB_KMALLOC | SLAB_NOLEAKTRACE))
 		mark_obj_codetag_empty(sheaf);
 
 	VM_WARN_ON_ONCE(sheaf->size > 0);
@@ -3027,10 +3053,13 @@ static void sheaf_flush_unused(struct kmem_cache *s, struct slab_sheaf *sheaf)
 static bool __rcu_free_sheaf_prepare(struct kmem_cache *s,
 				     struct slab_sheaf *sheaf)
 {
-	bool init = slab_want_init_on_free(s);
+	unsigned int free_flags = SLAB_FREE_AFTER_RCU_DELAY;
 	void **p = &sheaf->objects[0];
 	unsigned int i = 0;
 	bool pfmemalloc = false;
+
+	if (slab_want_init_on_free(s))
+		free_flags |= SLAB_FREE_INIT;
 
 	while (i < sheaf->size) {
 		struct slab *slab = virt_to_slab(p[i]);
@@ -3038,7 +3067,7 @@ static bool __rcu_free_sheaf_prepare(struct kmem_cache *s,
 		memcg_slab_free_hook(s, slab, p + i, 1);
 		alloc_tagging_slab_free_hook(s, slab, p + i, 1);
 
-		if (unlikely(!slab_free_hook(s, p[i], init, true))) {
+		if (unlikely(!slab_free_hook(s, p[i], free_flags))) {
 			p[i] = p[--sheaf->size];
 			continue;
 		}
@@ -4145,7 +4174,6 @@ static void flush_all(struct kmem_cache *s)
 struct deferred_percpu_work {
 	struct llist_head objects;
 	struct llist_head objects_by_rcu;
-	struct llist_head rcu_sheaves;
 	struct irq_work work;
 };
 
@@ -4154,7 +4182,6 @@ static void deferred_percpu_work_fn(struct irq_work *work);
 static DEFINE_PER_CPU(struct deferred_percpu_work, deferred_percpu_work) = {
 	.objects = LLIST_HEAD_INIT(objects),
 	.objects_by_rcu = LLIST_HEAD_INIT(objects_by_rcu),
-	.rcu_sheaves = LLIST_HEAD_INIT(rcu_sheaves),
 	.work = IRQ_WORK_INIT(deferred_percpu_work_fn),
 };
 
@@ -4729,7 +4756,8 @@ bool slab_post_alloc_hook(struct kmem_cache *s, gfp_t flags, size_t size,
 		if (init && p[i] && !is_kfence_address(p[i]))
 			memset(p[i], 0, zero_size);
 
-		if (alloc_flags_allow_spinning(ac->alloc_flags))
+		if (alloc_flags_allow_spinning(ac->alloc_flags) &&
+		    !(ac->alloc_flags & SLAB_ALLOC_NO_LEAKTRACE))
 			kmemleak_alloc_recursive(p[i], s->object_size, 1,
 						 s->flags, init_flags);
 		kmsan_slab_alloc(s, p[i], init_flags);
@@ -6128,14 +6156,69 @@ got_empty:
 	return pcs;
 }
 
+static __always_inline bool can_free_to_pcs(struct slab *slab)
+{
+	int slab_node;
+	int numa_node;
+
+	if (!IS_ENABLED(CONFIG_NUMA))
+		goto check_pfmemalloc;
+
+	slab_node = slab_nid(slab);
+
+#ifdef CONFIG_HAVE_MEMORYLESS_NODES
+	/*
+	 * numa_mem_id() points to the closest node with memory so only allow
+	 * objects from that node to the percpu sheaves
+	 */
+	numa_node = numa_mem_id();
+
+	if (likely(slab_node == numa_node))
+		goto check_pfmemalloc;
+#else
+
+	/*
+	 * numa_mem_id() is only a wrapper to numa_node_id() which is where this
+	 * cpu belongs to, but it might be a memoryless node anyway. We don't
+	 * know what the closest node is.
+	 */
+	numa_node = numa_node_id();
+
+	/* freed object is from this cpu's node, proceed */
+	if (likely(slab_node == numa_node))
+		goto check_pfmemalloc;
+
+	/*
+	 * Freed object isn't from this cpu's node, but that node is memoryless
+	 * or only has ZONE_MOVABLE memory, which slab cannot allocate from.
+	 * Proceed as it's better to cache remote objects than falling back to
+	 * the slowpath for everything. The allocation side can never obtain
+	 * a local object anyway, if none exist. We don't have numa_mem_id() to
+	 * point to the closest node as we would on a proper memoryless node
+	 * setup.
+	 */
+	if (unlikely(!node_state(numa_node, N_NORMAL_MEMORY)))
+		goto check_pfmemalloc;
+#endif
+
+	return false;
+
+check_pfmemalloc:
+	return likely(!slab_test_pfmemalloc(slab));
+}
+
 /*
  * Free an object to the percpu sheaves.
  * The object is expected to have passed slab_free_hook() already.
  */
 static __fastpath_inline
-bool free_to_pcs(struct kmem_cache *s, void *object, bool allow_spin)
+bool free_to_pcs(struct kmem_cache *s, struct slab *slab, void *object,
+		 unsigned int free_flags)
 {
 	struct slub_percpu_sheaves *pcs;
+
+	if (unlikely(!can_free_to_pcs(slab)))
+		return false;
 
 	if (!local_trylock(&s->cpu_sheaves->lock))
 		return false;
@@ -6143,6 +6226,7 @@ bool free_to_pcs(struct kmem_cache *s, void *object, bool allow_spin)
 	pcs = this_cpu_ptr(s->cpu_sheaves);
 
 	if (unlikely(pcs->main->size == s->sheaf_capacity)) {
+		bool allow_spin = free_flags_allow_spinning(free_flags);
 
 		pcs = __pcs_replace_full_main(s, pcs, allow_spin);
 		if (unlikely(!pcs))
@@ -6324,22 +6408,8 @@ do_free:
 	 * we flush before local_unlock to make sure a racing
 	 * flush_all_rcu_sheaves() doesn't miss this sheaf
 	 */
-	if (rcu_sheaf) {
-		/*
-		 * With !allow_spin, we might have interrupted call_rcu()'s
-		 * IRQ-disabled critical section. If IRQs are not disabled,
-		 * we know that's not the case.
-		 */
-		if (unlikely(!allow_spin && irqs_disabled())) {
-			struct deferred_percpu_work *dpw;
-
-			dpw = this_cpu_ptr(&deferred_percpu_work);
-			if (llist_add(&rcu_sheaf->llnode, &dpw->rcu_sheaves))
-				irq_work_queue(&dpw->work);
-		} else {
-			call_rcu(&rcu_sheaf->rcu_head, rcu_free_sheaf);
-		}
-	}
+	if (rcu_sheaf)
+		call_rcu(&rcu_sheaf->rcu_head, rcu_free_sheaf);
 
 	local_unlock(&s->cpu_sheaves->lock);
 
@@ -6354,57 +6424,6 @@ fail:
 	if (!IS_ENABLED(CONFIG_PREEMPT_RT))
 		lock_map_release(&kfree_rcu_sheaf_map);
 	return false;
-}
-
-static __always_inline bool can_free_to_pcs(struct slab *slab)
-{
-	int slab_node;
-	int numa_node;
-
-	if (!IS_ENABLED(CONFIG_NUMA))
-		goto check_pfmemalloc;
-
-	slab_node = slab_nid(slab);
-
-#ifdef CONFIG_HAVE_MEMORYLESS_NODES
-	/*
-	 * numa_mem_id() points to the closest node with memory so only allow
-	 * objects from that node to the percpu sheaves
-	 */
-	numa_node = numa_mem_id();
-
-	if (likely(slab_node == numa_node))
-		goto check_pfmemalloc;
-#else
-
-	/*
-	 * numa_mem_id() is only a wrapper to numa_node_id() which is where this
-	 * cpu belongs to, but it might be a memoryless node anyway. We don't
-	 * know what the closest node is.
-	 */
-	numa_node = numa_node_id();
-
-	/* freed object is from this cpu's node, proceed */
-	if (likely(slab_node == numa_node))
-		goto check_pfmemalloc;
-
-	/*
-	 * Freed object isn't from this cpu's node, but that node is memoryless
-	 * or only has ZONE_MOVABLE memory, which slab cannot allocate from.
-	 * Proceed as it's better to cache remote objects than falling back to
-	 * the slowpath for everything. The allocation side can never obtain
-	 * a local object anyway, if none exist. We don't have numa_mem_id() to
-	 * point to the closest node as we would on a proper memoryless node
-	 * setup.
-	 */
-	if (unlikely(!node_state(numa_node, N_NORMAL_MEMORY)))
-		goto check_pfmemalloc;
-#endif
-
-	return false;
-
-check_pfmemalloc:
-	return likely(!slab_test_pfmemalloc(slab));
 }
 
 /*
@@ -6483,9 +6502,12 @@ no_empty:
  */
 static void free_to_pcs_bulk(struct kmem_cache *s, size_t size, void **p)
 {
-	bool init = slab_want_init_on_free(s);
+	unsigned int free_flags = SLAB_FREE_DEFAULT;
 	void **remote_objects = p;
 	unsigned int remote_nr = 0;
+
+	if (slab_want_init_on_free(s))
+		free_flags |= SLAB_FREE_INIT;
 
 	/*
 	 * Process the free hooks and separate out remote objects by
@@ -6501,7 +6523,7 @@ static void free_to_pcs_bulk(struct kmem_cache *s, size_t size, void **p)
 		memcg_slab_free_hook(s, slab, p + i, 1);
 		alloc_tagging_slab_free_hook(s, slab, p + i, 1);
 
-		if (unlikely(!slab_free_hook(s, p[i], init, false))) {
+		if (unlikely(!slab_free_hook(s, p[i], free_flags))) {
 			p[i] = p[--size];
 			continue;
 		}
@@ -6549,12 +6571,10 @@ static void free_to_pcs_bulk(struct kmem_cache *s, size_t size, void **p)
 static void deferred_percpu_work_fn(struct irq_work *work)
 {
 	struct deferred_percpu_work *dpw;
-	struct llist_head *objs, *objs_by_rcu, *rcu_sheaves;
+	struct llist_head *objs, *objs_by_rcu;
 	struct llist_node *llnode, *pos, *t;
-	struct slab_sheaf *sheaf, *next;
 
 	dpw = container_of(work, struct deferred_percpu_work, work);
-	rcu_sheaves = &dpw->rcu_sheaves;
 	objs = &dpw->objects;
 	objs_by_rcu = &dpw->objects_by_rcu;
 
@@ -6588,10 +6608,6 @@ static void deferred_percpu_work_fn(struct irq_work *work)
 
 		kvfree_call_rcu(head, objp);
 	}
-
-	llnode = llist_del_all(rcu_sheaves);
-	llist_for_each_entry_safe(sheaf, next, llnode, llnode)
-		call_rcu(&sheaf->rcu_head, rcu_free_sheaf);
 }
 
 static void defer_free(struct kmem_cache *s, void *head)
@@ -6621,7 +6637,11 @@ void defer_kfree_rcu(struct kvfree_rcu_head *head)
 /* Must be called before flush_rcu_sheaves_on_cache() */
 void deferred_work_barrier(void)
 {
+	static DEFINE_MUTEX(barrier_mutex);
 	int cpu;
+
+	/* irq_work_sync() may use rcuwait that requires serialization */
+	guard(mutex)(&barrier_mutex);
 
 	for_each_possible_cpu(cpu)
 		irq_work_sync(&per_cpu_ptr(&deferred_percpu_work, cpu)->work);
@@ -6631,13 +6651,18 @@ static __fastpath_inline
 void slab_free(struct kmem_cache *s, struct slab *slab, void *object,
 	       unsigned long addr)
 {
+	unsigned int free_flags = SLAB_FREE_DEFAULT;
+
+	if (slab_want_init_on_free(s))
+		free_flags |= SLAB_FREE_INIT;
+
 	memcg_slab_free_hook(s, slab, &object, 1);
 	alloc_tagging_slab_free_hook(s, slab, &object, 1);
 
-	if (unlikely(!slab_free_hook(s, object, slab_want_init_on_free(s), false)))
+	if (unlikely(!slab_free_hook(s, object, free_flags)))
 		return;
 
-	if (likely(can_free_to_pcs(slab)) && likely(free_to_pcs(s, object, true)))
+	if (likely(free_to_pcs(s, slab, object, free_flags)))
 		return;
 
 	__slab_free(s, slab, object, object, 1, addr);
@@ -6647,14 +6672,27 @@ void slab_free(struct kmem_cache *s, struct slab *slab, void *object,
 #ifdef CONFIG_MEMCG
 /* Do not inline the rare memcg charging failed path into the allocation path */
 static noinline
-void memcg_alloc_abort_single(struct kmem_cache *s, void *object)
+void memcg_alloc_abort_single(struct kmem_cache *s, void *object,
+			      unsigned int alloc_flags)
 {
 	struct slab *slab = virt_to_slab(object);
+	unsigned int free_flags = to_free_flags(alloc_flags);
+
+	if (slab_want_init_on_free(s))
+		free_flags |= SLAB_FREE_INIT;
 
 	alloc_tagging_slab_free_hook(s, slab, &object, 1);
 
-	if (likely(slab_free_hook(s, object, slab_want_init_on_free(s), false)))
+	if (unlikely(!slab_free_hook(s, object, free_flags)))
+		return;
+
+	if (likely(free_to_pcs(s, slab, object, free_flags)))
+		return;
+
+	if (likely(free_flags_allow_spinning(free_flags)))
 		__slab_free(s, slab, object, object, 1, _RET_IP_);
+	else
+		defer_free(s, object);
 }
 #endif
 
@@ -6682,6 +6720,7 @@ static void slab_free_after_rcu_debug(struct rcu_head *rcu_head)
 	void *object = delayed_free->object;
 	struct slab *slab = virt_to_slab(object);
 	struct kmem_cache *s;
+	unsigned int free_flags = SLAB_FREE_AFTER_RCU_DELAY;
 
 	kfree(delayed_free);
 
@@ -6695,8 +6734,11 @@ static void slab_free_after_rcu_debug(struct rcu_head *rcu_head)
 	if (WARN_ON(!(s->flags & SLAB_TYPESAFE_BY_RCU)))
 		return;
 
+	if (slab_want_init_on_free(s))
+		free_flags |= SLAB_FREE_INIT;
+
 	/* resume freeing */
-	if (slab_free_hook(s, object, slab_want_init_on_free(s), true)) {
+	if (slab_free_hook(s, object, free_flags)) {
 		__slab_free(s, slab, object, object, 1, _THIS_IP_);
 		stat(s, FREE_SLOWPATH);
 	}
@@ -6945,6 +6987,7 @@ void kfree_nolock(const void *object)
 	struct slab *slab;
 	struct kmem_cache *s;
 	void *x = (void *)object;
+	unsigned int free_flags = SLAB_FREE_NOLOCK;
 
 	if (unlikely(ZERO_OR_NULL_PTR(object)))
 		return;
@@ -6959,35 +7002,14 @@ void kfree_nolock(const void *object)
 
 	memcg_slab_free_hook(s, slab, &x, 1);
 	alloc_tagging_slab_free_hook(s, slab, &x, 1);
-	/*
-	 * Unlike slab_free() do NOT call the following:
-	 * kmemleak_free_recursive(x, s->flags);
-	 * debug_check_no_locks_freed(x, s->object_size);
-	 * debug_check_no_obj_freed(x, s->object_size);
-	 * __kcsan_check_access(x, s->object_size, ..);
-	 * kfence_free(x);
-	 * since they take spinlocks or not safe from any context.
-	 */
-	kmsan_slab_free(s, x);
-	/*
-	 * If KASAN finds a kernel bug it will do kasan_report_invalid_free()
-	 * which will call raw_spin_lock_irqsave() which is technically
-	 * unsafe from NMI, but take chance and report kernel bug.
-	 * The sequence of
-	 * kasan_report_invalid_free() -> raw_spin_lock_irqsave() -> NMI
-	 *  -> kfree_nolock() -> kasan_report_invalid_free() on the same CPU
-	 * is double buggy and deserves to deadlock.
-	 */
-	if (kasan_slab_pre_free(s, x, false))
-		return;
-	/*
-	 * memcg, kasan_slab_pre_free are done for 'x'.
-	 * The only thing left is kasan_poison without quarantine,
-	 * since kasan quarantine takes locks and not supported from NMI.
-	 */
-	kasan_slab_free(s, x, false, false, /* skip quarantine */true);
 
-	if (likely(can_free_to_pcs(slab)) && likely(free_to_pcs(s, x, false)))
+	if (slab_want_init_on_free(s))
+		free_flags |= SLAB_FREE_INIT;
+
+	if (unlikely(!slab_free_hook(s, x, free_flags)))
+		return;
+
+	if (likely(free_to_pcs(s, slab, x, free_flags)))
 		return;
 
 	/*
@@ -8009,13 +8031,8 @@ static unsigned int calculate_sheaf_capacity(struct kmem_cache *s,
 	if (IS_ENABLED(CONFIG_SLUB_TINY) || s->flags & SLAB_DEBUG_FLAGS)
 		return 0;
 
-	/*
-	 * Bootstrap caches can't have sheaves for now (SLAB_NO_SHEAVES).
-	 * SLAB_NOLEAKTRACE caches (e.g., kmemleak's object_cache) must not
-	 * have sheaves to avoid recursion when sheaf allocation triggers
-	 * kmemleak tracking.
-	 */
-	if (s->flags & (SLAB_NO_SHEAVES | SLAB_NOLEAKTRACE))
+	/* Bootstrap caches can't have sheaves for now (SLAB_NO_SHEAVES). */
+	if (s->flags & SLAB_NO_SHEAVES)
 		return 0;
 
 	/*
