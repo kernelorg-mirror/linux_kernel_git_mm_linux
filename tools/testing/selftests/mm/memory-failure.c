@@ -266,10 +266,8 @@ static int prepare_file(const char *fname, unsigned long size)
 	int fd;
 
 	fd = open(fname, O_RDWR | O_CREAT, 0664);
-	if (fd >= 0) {
-		unlink(fname);
+	if (fd >= 0)
 		ftruncate(fd, size);
-	}
 	return fd;
 }
 
@@ -300,26 +298,54 @@ static int get_fs_type(int fd)
 	return ret ? 0 : (int)fs.f_type;
 }
 
+/*
+ * The page-cache tests need a filesystem which keeps its data on backing
+ * store.  When a clean page is poisoned the kernel drops it and the data is
+ * read back in.  When a dirty page is poisoned the data is lost, and the
+ * kernel records -EIO in the mapping for fsync() to report.
+ *
+ * tmpfs and ramfs keep their data only in the page cache.  The poisoned
+ * page cannot be dropped and read back, and their fsync() does nothing, so
+ * neither expectation holds.  hugetlbfs is the same, and it also poisons a
+ * whole huge page.  shmem has its own tests below.
+ */
+static bool fs_has_backing_store(int fs_type)
+{
+	switch ((unsigned int)fs_type) {
+	case 0:
+	case TMPFS_MAGIC:
+	case RAMFS_MAGIC:
+	case HUGETLBFS_MAGIC:
+		return false;
+	}
+	return true;
+}
+
 TEST_F(memory_failure, clean_pagecache)
 {
 	int fd;
 	char *addr;
 	int ret;
 	int fs_type;
+	const char *fname = "./clean-page-cache-test-file";
 
-	fd = prepare_file("./clean-page-cache-test-file", self->page_size);
+	fd = prepare_file(fname, self->page_size);
 	if (fd < 0)
 		SKIP(return, "failed to open test file.\n");
 	fs_type = get_fs_type(fd);
-	if (!fs_type || fs_type == TMPFS_MAGIC) {
+	if (!fs_has_backing_store(fs_type)) {
+		unlink(fname);
 		close(fd);
 		SKIP(return, "unsupported filesystem :%x\n", fs_type);
 	}
 
 	addr = mmap(0, self->page_size, PROT_READ | PROT_WRITE,
 		    MAP_SHARED, fd, 0);
-	if (addr == MAP_FAILED)
+	if (addr == MAP_FAILED) {
+		unlink(fname);
+		close(fd);
 		SKIP(return, "mmap failed, not enough memory.\n");
+	}
 	memset(addr, 0xce, self->page_size);
 	fsync(fd);
 
@@ -339,6 +365,7 @@ TEST_F(memory_failure, clean_pagecache)
 
 	ASSERT_EQ(munmap(addr, self->page_size), 0);
 
+	unlink(fname);
 	ASSERT_EQ(close(fd), 0);
 }
 
@@ -348,26 +375,34 @@ TEST_F(memory_failure, dirty_pagecache)
 	char *addr;
 	int ret;
 	int fs_type;
+	const char *fname = "./dirty-page-cache-test-file";
 
-	fd = prepare_file("./dirty-page-cache-test-file", self->page_size);
+	fd = prepare_file(fname, self->page_size);
 	if (fd < 0)
 		SKIP(return, "failed to open test file.\n");
 	fs_type = get_fs_type(fd);
-	/*
-	 * MADV_HARD poisoning of dirty page-cache data records an expected
-	 * -EIO in the file mapping. NFS reports this error on close(), so
-	 * skip this variant.
-	 */
-	if (!fs_type || fs_type == TMPFS_MAGIC ||
-	    (fs_type == NFS_SUPER_MAGIC && variant->type == MADV_HARD)) {
+	if (!fs_has_backing_store(fs_type)) {
+		unlink(fname);
 		close(fd);
 		SKIP(return, "unsupported filesystem :%x\n", fs_type);
+	}
+	/*
+	 * nilfs2 does not check the mapping error in nilfs_sync_file().
+	 * Remove this skip when its fsync() reports poisoned dirty data.
+	 */
+	if (fs_type == NILFS_SUPER_MAGIC && variant->type == MADV_HARD) {
+		unlink(fname);
+		close(fd);
+		SKIP(return, "nilfs2 fsync() does not report poisoned dirty data\n");
 	}
 
 	addr = mmap(0, self->page_size, PROT_READ | PROT_WRITE,
 		    MAP_SHARED, fd, 0);
-	if (addr == MAP_FAILED)
+	if (addr == MAP_FAILED) {
+		unlink(fname);
+		close(fd);
 		SKIP(return, "mmap failed, not enough memory.\n");
+	}
 	memset(addr, 0xce, self->page_size);
 
 	prepare(_metadata, self, addr);
@@ -386,6 +421,25 @@ TEST_F(memory_failure, dirty_pagecache)
 
 	ASSERT_EQ(munmap(addr, self->page_size), 0);
 
+	/*
+	 * MADV_HARD poisoning of dirty page-cache data records -EIO in the
+	 * file's mapping.  fsync() must report that error.  Doing so also
+	 * consumes it, so the filesystems which report mapping errors from
+	 * close() (NFS, FUSE and others) have nothing left to report there.
+	 */
+	if (variant->type == MADV_HARD) {
+		ASSERT_EQ(fsync(fd), -1);
+		ASSERT_EQ(errno, EIO);
+		/*
+		 * A filesystem which could not remove the poisoned page from
+		 * its page cache (FUSE, for one) keeps it until the inode is
+		 * evicted, which can be after close() returns.  Remove it now
+		 * so that teardown can unpoison the page.
+		 */
+		ASSERT_EQ(ftruncate(fd, 0), 0);
+	}
+
+	unlink(fname);
 	ASSERT_EQ(close(fd), 0);
 }
 
