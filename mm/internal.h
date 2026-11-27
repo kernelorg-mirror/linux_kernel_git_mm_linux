@@ -960,6 +960,8 @@ extern long faultin_page_range(struct mm_struct *mm, unsigned long start,
 		unsigned long end, bool write, int *locked);
 bool mlock_future_ok(const struct mm_struct *mm, bool is_vma_locked,
 		unsigned long bytes);
+bool file_mmap_ok(struct file *file, struct inode *inode, unsigned long pgoff,
+		  unsigned long len);
 
 /*
  * NOTE: This function can't tell whether the folio is "fully mapped" in the
@@ -1266,6 +1268,7 @@ struct migration_target_control {
  */
 ssize_t splice_folio_into_pipe(struct pipe_inode_info *pipe,
 			       struct folio *folio, loff_t fpos, size_t size);
+bool folio_wait_bit_timeout(struct folio *folio, int bit_nr, long timeout);
 
 static inline bool vma_is_single_threaded_private(struct vm_area_struct *vma)
 {

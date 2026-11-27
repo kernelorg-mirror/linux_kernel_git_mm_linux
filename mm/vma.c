@@ -2375,15 +2375,10 @@ static void vm_lock_mapping(struct mm_struct *mm, struct address_space *mapping)
  * mapping->flags avoid to take the same lock twice, if more than one
  * vma in this mm is backed by the same anon rmap or address_space.
  *
- * We take locks in following order, accordingly to comment at beginning
- * of mm/rmap.c:
- *   - all hugetlbfs_i_mmap_rwsem_key locks (aka mapping->i_mmap_rwsem for
- *     hugetlb mapping);
- *   - all vmas marked locked
- *   - all i_mmap_rwsem locks;
- *   - all anon_vma->rwseml
+ * Mark all vmas locked, before taking mm_all_locks_mutex. Then take remaining
+ * locks in the order mandated by the comment at the top of mm/rmap.c.
  *
- * We can take all locks within these types randomly because the VM code
+ * We can take locks of the same type in arbitrary order because the VM code
  * doesn't nest them and we protected from parallel mm_take_all_locks() by
  * mm_all_locks_mutex.
  *
@@ -2400,19 +2395,23 @@ int mm_take_all_locks(struct mm_struct *mm)
 
 	mmap_assert_write_locked(mm);
 
-	mutex_lock(&mm_all_locks_mutex);
-
 	/*
-	 * vma_start_write() does not have a complement in mm_drop_all_locks()
-	 * because vma_start_write() is always asymmetrical; it marks a VMA as
+	 * VMA write locks do not have a complement in mm_drop_all_locks(),
+	 * because VMA write locking is always asymmetrical; it marks a VMA as
 	 * being written to until mmap_write_unlock() or mmap_write_downgrade()
 	 * is reached.
 	 */
 	for_each_vma(vmi, vma) {
+		int err;
+
 		if (signal_pending(current))
-			goto out_unlock;
-		vma_start_write(vma);
+			return -EINTR;
+		err = vma_start_write_killable(vma);
+		if (err)
+			return err;
 	}
+
+	mutex_lock(&mm_all_locks_mutex);
 
 	vma_iter_init(&vmi, mm, 0);
 	for_each_vma(vmi, vma) {
@@ -3236,6 +3235,10 @@ int do_brk_flags(struct vma_iterator *vmi, struct vm_area_struct *vma,
 	vma_flags_set(&vma_flags, VMA_ACCOUNT_BIT);
 	vma_flags_set_mask(&vma_flags, mm->def_vma_flags);
 
+	/* The flags are implied, so under MDWE drop exec rather than fail. */
+	if (mm_flags_test(MMF_HAS_MDWE, mm))
+		vma_flags_clear(&vma_flags, VMA_EXEC_BIT);
+
 	vma_flags = ksm_vma_flags(mm, NULL, vma_flags);
 	if (!may_expand_vm(mm, &vma_flags, len >> PAGE_SHIFT))
 		return -ENOMEM;
@@ -3369,8 +3372,6 @@ unsigned long unmapped_area_topdown(struct vm_unmapped_area_info *info)
 {
 	unsigned long length, gap, gap_end;
 	unsigned long low_limit, high_limit;
-	struct vm_area_struct *tmp;
-	VMA_ITERATOR(vmi, current->mm, 0);
 
 	/* Adjust search length to account for worst case alignment overhead */
 	length = info->length + info->align_mask + info->start_gap;
@@ -3381,31 +3382,31 @@ unsigned long unmapped_area_topdown(struct vm_unmapped_area_info *info)
 	if (low_limit < mmap_min_addr)
 		low_limit = mmap_min_addr;
 	high_limit = info->high_limit;
-retry:
-	if (vma_iter_area_highest(&vmi, low_limit, high_limit, length))
-		return -ENOMEM;
 
-	gap = vma_iter_end(&vmi) - info->length;
-	gap -= (gap - info->align_offset) & info->align_mask;
-	gap_end = vma_iter_end(&vmi);
-	tmp = vma_next(&vmi);
-	 /* Avoid prev check if possible */
-	if (tmp && vma_test_any_mask(tmp, VMA_STARTGAP_FLAGS)) {
-		if (vm_start_gap(tmp) < gap_end) {
+	while (low_limit < high_limit) {
+		VMA_ITERATOR(vmi, current->mm, 0);
+		struct vm_area_struct *tmp;
+
+		if (vma_iter_area_highest(&vmi, low_limit, high_limit, length))
+			break;
+
+		gap = vma_iter_end(&vmi) - info->length;
+		gap -= (gap - info->align_offset) & info->align_mask;
+		gap_end = vma_iter_end(&vmi);
+		tmp = vma_next(&vmi);
+		/* Avoid prev check if possible */
+		if (tmp && vma_test_any_mask(tmp, VMA_STARTGAP_FLAGS)) {
+			if (vm_start_gap(tmp) >= gap_end)
+				return gap;
 			high_limit = vm_start_gap(tmp);
-			vma_iter_reset(&vmi);
-			goto retry;
-		}
-	} else {
-		tmp = vma_prev(&vmi);
-		if (tmp && vm_end_gap(tmp) > gap) {
+		} else {
+			tmp = vma_prev(&vmi);
+			if (!tmp || vm_end_gap(tmp) <= gap)
+				return gap;
 			high_limit = tmp->vm_start;
-			vma_iter_reset(&vmi);
-			goto retry;
 		}
 	}
-
-	return gap;
+	return -ENOMEM;
 }
 
 /*

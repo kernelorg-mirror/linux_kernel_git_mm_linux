@@ -1043,6 +1043,65 @@ static bool may_enter_fs(struct folio *folio, gfp_t gfp_mask)
 }
 
 /*
+ * Legacy memcg reclaim has no dirty throttling and waits for writeback in
+ * shrink_folio_list() instead. That wait can deadlock against a filesystem
+ * freeze:
+ *
+ * 1. A task holds freeze protection on filesystem B, e.g. in write(), enters
+ *    reclaim and waits for writeback of a folio whose I/O ends up as a write to
+ *    B, e.g. through a loop device backed by a file on B.
+ *
+ * 2. A freeze of B waits for the task to drop its freeze protection.
+ *
+ * 3. The write to B waits for the freeze.
+ *
+ * Reclaim can't tell which filesystem a writeback depends on. As a crude
+ * workaround, memcg_wait_writeback() times out and, if any filesystem is being
+ * frozen at that point, sets a skip flag on the reclaim target memcg. While
+ * it is set, reclaim against that target neither waits for nor throttles on
+ * writeback, so that the task a freeze may be waiting for isn't held up in
+ * reclaim and can drop its freeze protection. This can cause premature memcg
+ * OOM kills in that reclaim target.
+ */
+#ifdef CONFIG_MEMCG
+/* Retain the skip across separate reclaim attempts against the same limit. */
+static bool memcg_skip_wb_wait(struct scan_control *sc)
+{
+	struct mem_cgroup *memcg = sc->target_mem_cgroup;
+
+	if (!memcg || !READ_ONCE(memcg->wb_wait_skip))
+		return false;
+	if (atomic_read(&sb_nr_freezing))
+		return true;
+	WRITE_ONCE(memcg->wb_wait_skip, false);
+	return false;
+}
+
+/* Wait for writeback, unless a freeze stalls this reclaim target. */
+static void memcg_wait_writeback(struct folio *folio, struct scan_control *sc)
+{
+	while (!folio_wait_bit_timeout(folio, PG_writeback, 15 * HZ)) {
+		if (atomic_read(&sb_nr_freezing)) {
+			WRITE_ONCE(sc->target_mem_cgroup->wb_wait_skip, true);
+			pr_warn("memcg writeback wait timed out during fs freeze; "
+				"skipping waits for reclaim target, may OOM early\n");
+			return;
+		}
+	}
+}
+#else
+static bool memcg_skip_wb_wait(struct scan_control *sc)
+{
+	return false;
+}
+
+static void memcg_wait_writeback(struct folio *folio, struct scan_control *sc)
+{
+	folio_wait_writeback(folio);
+}
+#endif
+
+/*
  * shrink_folio_list() returns the number of reclaimed pages
  */
 static unsigned int shrink_folio_list(struct list_head *folio_list,
@@ -1163,7 +1222,9 @@ retry:
 		 *    reclaim flag set. memcg does not have any dirty folio
 		 *    throttling so we could easily OOM just because too many
 		 *    folios are in writeback and there is nothing else to
-		 *    reclaim. Wait for the writeback to complete.
+		 *    reclaim. Wait for the writeback to complete. If
+		 *    memcg_wait_writeback() gives up, such folios are treated
+		 *    as in case 2 until no filesystem is being frozen.
 		 *
 		 * In cases 1) and 2) we activate the folios to get them out of
 		 * the way while we continue scanning for clean folios on the
@@ -1186,6 +1247,7 @@ retry:
 
 			/* Case 2 above */
 			} else if (writeback_throttling_sane(sc) ||
+			    memcg_skip_wb_wait(sc) ||
 			    !folio_test_reclaim(folio) ||
 			    !may_enter_fs(folio, sc->gfp_mask) ||
 			    (mapping &&
@@ -1211,7 +1273,7 @@ retry:
 			/* Case 3 above */
 			} else {
 				folio_unlock(folio);
-				folio_wait_writeback(folio);
+				memcg_wait_writeback(folio, sc);
 				/* then go back and try same folio again */
 				list_add_tail(&folio->lru, folio_list);
 				continue;
@@ -1974,7 +2036,7 @@ static void handle_reclaim_writeback(unsigned long nr_taken,
 		 * enough for cgroupv1 writeback throttling to work
 		 * on a large system.
 		 */
-		if (!writeback_throttling_sane(sc))
+		if (!writeback_throttling_sane(sc) && !memcg_skip_wb_wait(sc))
 			reclaim_throttle(pgdat, VMSCAN_THROTTLE_WRITEBACK);
 	}
 
@@ -4551,6 +4613,8 @@ static void try_to_inc_max_seq_nowalk(struct mem_cgroup *memcg,
 		spin_lock(&mm_list->lock);
 		VM_WARN_ON_ONCE(mm_state->seq + 1 < max_seq);
 		if (max_seq > mm_state->seq) {
+			mm_state->head = NULL;
+			mm_state->tail = NULL;
 			WRITE_ONCE(mm_state->seq, mm_state->seq + 1);
 			success = true;
 		}
